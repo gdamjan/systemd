@@ -32,8 +32,12 @@ _bootctl() {
     local i verb comps
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
     local -A OPTS=(
-        [STANDALONE]='-h --help -p --print-esp-path -x --print-boot-path --version --no-variables --no-pager --graceful --dry-run'
-        [ARG]='--esp-path --boot-path --make-machine-id-directory --root --image --install-source --random-seed'
+        [STANDALONE]='-h --help -p --print-esp-path -x --print-boot-path -R --print-root-device
+                      --print-loader-path --print-stub-path
+                      --version --no-variables --no-pager --graceful --dry-run'
+        [ARG]='--esp-path --boot-path --make-entry-directory --root --image --install-source --random-seed
+               --secure-boot-auto-enroll --private-key --private-key-source
+               --certificate --certificate-source --json'
     )
 
     if __contains_word "$prev" ${OPTS[ARG]}; then
@@ -46,7 +50,7 @@ _bootctl() {
                 fi
                 compopt -o filenames
                 ;;
-            --make-machine-id-directory)
+            --make-entry-directory)
                 comps="yes no auto"
                 ;;
             --image|--root)
@@ -58,6 +62,12 @@ _bootctl() {
                 ;;
             --random-seed)
                 comps="yes no"
+                ;;
+            --secure-boot-auto-enroll)
+                comps="yes no"
+                ;;
+            --json)
+                comps="short pretty off"
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
