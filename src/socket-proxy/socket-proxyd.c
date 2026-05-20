@@ -392,6 +392,19 @@ static int resolve_remote(Connection *c) {
                 return connection_start(c, &address.sockaddr.sa, address.size);
         }
 
+        if (startswith(arg_remote_host, "vsock-mux:")) {
+                union sockaddr_union sa;
+                int sa_len;
+
+                r = sockaddr_un_set_path(&sa.un, arg_remote_host);
+                if (r < 0)
+                        return log_error_errno(r, "Specified address doesn't fit in an AF_UNIX address, refusing: %m");
+                sa_len = r;
+
+                return connection_start_mux(c, &sa.sa, sa_len, port);
+        }
+
+
         service = strrchr(arg_remote_host, ':');
         if (service) {
                 node = strndupa_safe(arg_remote_host,
