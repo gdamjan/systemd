@@ -362,6 +362,8 @@ static inline size_t strcount_char(const char *s, char c) {
         return n;
 }
 
+static int connection_start_mux(Connection *c, struct sockaddr *sa, socklen_t salen, unsigned int port) {}
+
 static int resolve_remote(Connection *c) {
 
         static const struct addrinfo hints = {
@@ -392,18 +394,31 @@ static int resolve_remote(Connection *c) {
                 return connection_start(c, &address.sockaddr.sa, address.size);
         }
 
-        if (startswith(arg_remote_host, "vsock-mux:")) {
+        if (startswith(arg_remote_host, "vsock-mux:") && strcount_char(arg_remote_host, ':') == 2) {
+                _cleanup_free_ char *path = NULL, *arg_port = NULL;
+
+                unsigned int port;
                 union sockaddr_union sa;
                 int sa_len;
 
-                r = sockaddr_un_set_path(&sa.un, arg_remote_host);
+                arg_remote_host = arg_remote_host + strlen("vsock-mux:");
+                r = split_pair(arg_remote_host, ":", &path, &arg_port);
+                if (r < 0)
+                        return r;
+
+                r = vsock_parse_port(arg_port, &port);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse vsock port: %s", arg_port);
+
+                r = sockaddr_un_set_path(&sa.un, path);
                 if (r < 0)
                         return log_error_errno(r, "Specified address doesn't fit in an AF_UNIX address, refusing: %m");
                 sa_len = r;
 
+                log_debug("Connect to vsock-mux\npath: %s\nport: %u\nsa_len: %d", path, port, sa_len);
+
                 return connection_start_mux(c, &sa.sa, sa_len, port);
         }
-
 
         service = strrchr(arg_remote_host, ':');
         if (service) {
