@@ -14,12 +14,11 @@
 #include "bus-util.h"
 #include "discover-image.h"
 #include "errno-util.h"
-#include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "hashmap.h"
 #include "hostname-util.h"
 #include "image.h"
+#include "image-clean-pool.h"
 #include "image-dbus.h"
 #include "io-util.h"
 #include "machine.h"
@@ -931,52 +930,10 @@ static int method_get_image_os_release(sd_bus_message *message, void *userdata, 
 }
 
 static int clean_pool_done(Operation *operation, int child_error, sd_bus_error *error) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_fclose_ FILE *file = NULL;
-        int r;
-
         assert(operation);
         assert(operation->message);
-        assert(operation->extra_fd >= 0);
 
-        file = take_fdopen(&operation->extra_fd, "r");
-        if (!file)
-                return log_debug_errno(errno, "Failed to take opened tmp file's fd: %m");
-
-        r = clean_pool_read_first_entry(file, child_error, error);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_new_method_return(operation->message, &reply);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_open_container(reply, 'a', "(st)");
-        if (r < 0)
-                return r;
-
-        /* On success the resulting temporary file will contain a list of image names that were removed followed by
-         * their size on disk. Let's read that and turn it into a bus message. */
-        for (;;) {
-                _cleanup_free_ char *name = NULL;
-                uint64_t usage;
-
-                r = clean_pool_read_next_entry(file, &name, &usage);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                r = sd_bus_message_append(reply, "(st)", name, usage);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_bus_message_close_container(reply);
-        if (r < 0)
-                return r;
-
-        return sd_bus_message_send(reply);
+        return image_clean_pool_reply(operation->message, &operation->extra_fd, child_error, error);
 }
 
 static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -995,11 +952,8 @@ static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        if (streq(mm, "all"))
-                mode = IMAGE_CLEAN_POOL_REMOVE_ALL;
-        else if (streq(mm, "hidden"))
-                mode = IMAGE_CLEAN_POOL_REMOVE_HIDDEN;
-        else
+        mode = image_clean_pool_mode_from_string(mm);
+        if (mode < 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unknown mode '%s'.", mm);
 
         if (m->runtime_scope != RUNTIME_SCOPE_USER) {

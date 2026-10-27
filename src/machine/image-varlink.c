@@ -11,6 +11,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "image.h"
+#include "image-clean-pool.h"
 #include "image-varlink.h"
 #include "io-util.h"
 #include "json-util.h"
