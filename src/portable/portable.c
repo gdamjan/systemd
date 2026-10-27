@@ -37,6 +37,7 @@
 #include "log.h"
 #include "loop-util.h"
 #include "mkdir.h"
+#include "mstack.h"
 #include "namespace-util.h"
 #include "nsresource.h"
 #include "os-util.h"
@@ -462,6 +463,150 @@ static int extract_now(
         return 0;
 }
 
+static int extract_mstack(
+                RuntimeScope scope,
+                int rfd,
+                const char *path,
+                bool path_is_extension,
+                char **matches,
+                const ImagePolicy *image_policy,
+                PortableMetadata **ret_os_release,
+                Hashmap **ret_unit_files,
+                sd_bus_error *error) {
+
+        _cleanup_hashmap_free_ Hashmap *unit_files = NULL;
+        _cleanup_(portable_metadata_unrefp) PortableMetadata* os_release = NULL;
+        _cleanup_(rmdir_and_freep) char *tmpdir = NULL;
+        _cleanup_close_pair_ int seq[2] = EBADF_PAIR, errno_pipe_fd[2] = EBADF_PAIR;
+        _cleanup_(pidref_done_sigkill_wait) PidRef child = PIDREF_NULL;
+        _cleanup_(mstack_freep) MStack *mstack = NULL;
+        _cleanup_close_ int userns_fd = -EBADF;
+        _cleanup_free_ char *image_name = NULL;
+        int r;
+
+        assert(rfd >= 0);
+        assert(path);
+        assert(ret_os_release);
+        assert(ret_unit_files);
+
+        /* Assembles the layers of a .mstack/ directory in a private mount namespace, and extracts the
+         * metadata from the resulting tree, the same way it is done for disk images. */
+
+        if (path_is_extension)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Image '%s' is an .mstack/ directory, which is not supported as extension.", path);
+
+        r = path_extract_filename(path, &image_name);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to extract image name from path '%s': %m", path);
+
+        char *e = endswith(image_name, ".mstack");
+        if (e)
+                *e = 0;
+
+        r = mstack_load(path, rfd, &mstack);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to load .mstack/ directory '%s': %m", path);
+
+        if (scope == RUNTIME_SCOPE_USER) {
+                userns_fd = nsresource_allocate_userns(
+                                /* vl= */ NULL,
+                                /* name= */ NULL,
+                                NSRESOURCE_UIDS_64K);
+                if (userns_fd < 0)
+                        return log_debug_errno(userns_fd, "Failed to allocate user namespace: %m");
+        }
+
+        r = mstack_open_images(
+                        mstack,
+                        /* mountfsd_link= */ NULL,
+                        userns_fd,
+                        image_policy,
+                        /* image_filter= */ NULL,
+                        MSTACK_RDONLY);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to open .mstack/ layer images of '%s': %m", path);
+
+        r = mkdtemp_malloc("/tmp/inspect-XXXXXX", &tmpdir);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to create temporary directory: %m");
+
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, seq) < 0)
+                return log_debug_errno(errno, "Failed to allocated SOCK_SEQPACKET socket: %m");
+
+        if (pipe2(errno_pipe_fd, O_CLOEXEC|O_NONBLOCK) < 0)
+                return log_debug_errno(errno, "Failed to create pipe: %m");
+
+        r = pidref_safe_fork(
+                        "(sd-mstack)",
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL|(scope == RUNTIME_SCOPE_SYSTEM ? FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE : 0),
+                        &child);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                seq[0] = safe_close(seq[0]);
+                errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
+
+                if (scope == RUNTIME_SCOPE_USER) {
+                        r = detach_mount_namespace_userns(userns_fd);
+                        if (r < 0) {
+                                log_debug_errno(r, "Failed to detach mount namespace: %m");
+                                report_errno_and_exit(errno_pipe_fd[1], r);
+                        }
+                }
+
+                /* The temporary directory is only used as a mount point for the intermediary mounts here,
+                 * which are not visible outside of our mount namespace. */
+                r = mstack_make_mounts(mstack, tmpdir, MSTACK_RDONLY);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to make .mstack/ mounts for '%s': %m", path);
+                        report_errno_and_exit(errno_pipe_fd[1], r);
+                }
+
+                _cleanup_close_ int mfd = -EBADF;
+                r = mstack_bind_mounts(mstack, tmpdir, /* where_fd= */ -EBADF, MSTACK_RDONLY, &mfd);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to bind mount .mstack/ mounts for '%s': %m", path);
+                        report_errno_and_exit(errno_pipe_fd[1], r);
+                }
+
+                r = extract_now(scope,
+                                mfd,
+                                path,
+                                matches,
+                                image_name,
+                                path_is_extension,
+                                /* relax_extension_release_check= */ false,
+                                seq[1],
+                                /* ret_os_release= */ NULL,
+                                /* ret_unit_files= */ NULL);
+                report_errno_and_exit(errno_pipe_fd[1], r);
+        }
+
+        seq[1] = safe_close(seq[1]);
+        errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
+
+        r = receive_portable_metadata(seq[0], path, &os_release, &unit_files);
+        if (r < 0)
+                return r;
+
+        r = pidref_wait_for_terminate_and_check("(sd-mstack)", &child, 0);
+        if (r < 0)
+                return r;
+
+        pidref_done(&child);
+
+        if (r != EXIT_SUCCESS) {
+                if (read(errno_pipe_fd[0], &r, sizeof(r)) == sizeof(r))
+                        return log_debug_errno(r, "Failed to extract portable metadata from '%s': %m", path);
+
+                return log_debug_errno(SYNTHETIC_ERRNO(EPROTO), "Child failed.");
+        }
+
+        *ret_os_release = TAKE_PTR(os_release);
+        *ret_unit_files = TAKE_PTR(unit_files);
+        return 0;
+}
+
 static int portable_extract_by_path(
                 RuntimeScope scope,
                 const char *path,
@@ -489,7 +634,20 @@ static int portable_extract_by_path(
         if (fstat(rfd, &st) < 0)
                 return log_debug_errno(errno, "Failed to stat '%s': %m", path);
 
-        if (S_ISDIR(st.st_mode)) {
+        if (S_ISDIR(st.st_mode) && endswith(path, ".mstack")) {
+                r = extract_mstack(
+                                scope,
+                                rfd,
+                                path,
+                                path_is_extension,
+                                matches,
+                                image_policy,
+                                &os_release,
+                                &unit_files,
+                                error);
+                if (r < 0)
+                        return r;
+        } else if (S_ISDIR(st.st_mode)) {
                 _cleanup_free_ char *image_name = NULL;
                 r = path_extract_filename(path, &image_name);
                 if (r < 0)

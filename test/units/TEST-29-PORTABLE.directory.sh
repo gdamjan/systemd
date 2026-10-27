@@ -51,6 +51,25 @@ test ! -e /var/lib/portables/.clean-attached
 test -d /var/lib/portables/clean-visible
 rm -rf /var/lib/portables/clean-visible
 
+# Metadata of .mstack/ images is extracted from the assembled layers. This needs FSCONFIG_SET_FD support in
+# overlayfs, see TEST-13-NSPAWN.pull-oci.sh.
+if systemd-analyze condition 'ConditionVersion=>=6.13'; then
+    cp -a /tmp/minimal_0 /var/lib/portables/.stacked-base
+    mkdir -p /var/lib/portables/.stacked-extra/opt
+    touch /var/lib/portables/.stacked-extra/opt/marker
+    mkdir /var/lib/portables/stacked.mstack
+    ln -s ../.stacked-base /var/lib/portables/stacked.mstack/layer@0
+    ln -s ../.stacked-extra /var/lib/portables/stacked.mstack/layer@1
+    portablectl inspect --cat stacked minimal-app0 | grep -F "minimal-app0.service" >/dev/null
+    portablectl inspect stacked minimal-app0 | grep -F "Operating System:" >/dev/null
+    portablectl "${ARGS[@]}" attach --runtime stacked minimal-app0
+    status="$(portablectl is-attached stacked)"
+    [[ "${status}" == "attached-runtime" ]]
+    grep -F "RootMStack=/var/lib/portables/stacked.mstack" /run/systemd/system.attached/minimal-app0.service.d/20-portable.conf >/dev/null
+    portablectl detach --runtime stacked minimal-app0
+    rm -rf /var/lib/portables/stacked.mstack /var/lib/portables/.stacked-base /var/lib/portables/.stacked-extra
+fi
+
 rm -rf /tmp/symlink-unit
 cp -a /tmp/minimal_0 /tmp/symlink-unit
 printf '[Service]\nExecStart=/bin/true\n' >/tmp/portable-host-unit
