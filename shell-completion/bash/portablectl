@@ -37,12 +37,12 @@ _portablectl() {
     local -A OPTS=(
         [STANDALONE]='-q --quiet --runtime --no-reload --cat --no-pager --no-legend
                               --no-ask-password --enable --now -h --help --version
-                              --clean --no-block --force --user --system'
+                              --clean --no-block --force --user --system -a --all'
         [ARG]='-p --profile --copy -H --host -M --machine --extension'
     )
 
     local -A VERBS=(
-        [STANDALONE]='list'
+        [STANDALONE]='list clean'
         [IMAGE]='attach detach reattach inspect is-attached set-limit'
         [IMAGES]='remove'
         [IMAGE_WITH_BOOL]='read-only'

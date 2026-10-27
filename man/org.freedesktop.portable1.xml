@@ -103,6 +103,8 @@ node /org/freedesktop/portable1 {
       SetImageLimit(in  s image,
                     in  t limit);
       SetPoolLimit(in  t limit);
+      CleanPool(in  s mode,
+                out a(st) images);
     properties:
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s PoolPath = '...';
@@ -158,6 +160,8 @@ node /org/freedesktop/portable1 {
     <variablelist class="dbus-method" generated="True" extra-ref="SetImageLimit()"/>
 
     <variablelist class="dbus-method" generated="True" extra-ref="SetPoolLimit()"/>
+
+    <variablelist class="dbus-method" generated="True" extra-ref="CleanPool()"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="PoolPath"/>
 
@@ -315,6 +319,13 @@ node /org/freedesktop/portable1 {
       <para><function>SetPoolLimit()</function> sets an overall quota limit on the pool of images.</para>
 
       <para><function>SetImageLimit()</function> sets a per-image quota limit.</para>
+
+      <para><function>CleanPool()</function> removes detached images. Takes a mode, either
+      <literal>hidden</literal> to only remove hidden images (i.e. those whose name begins with a dot), or
+      <literal>all</literal> to remove all images. Images in <filename>/usr/</filename> are never removed.
+      In <literal>hidden</literal> mode, images that are referenced via a symbolic link from a
+      <filename>.mstack/</filename> directory are kept. Returns an array of the names of the removed images
+      and the disk space freed by removing each of them, or <constant>UINT64_MAX</constant> if unknown.</para>
 
       <para>The <function>AttachImageWithExtensions()</function>,
       <function>DetachImageWithExtensions()</function> and
@@ -584,6 +595,7 @@ node /org/freedesktop/portable1 {
     <refsect2>
       <title>The Manager Object</title>
       <para><function>GetImageStateWithExtensions()</function> was added in version 251.</para>
+      <para><function>CleanPool()</function> was added in version 263.</para>
     </refsect2>
     <refsect2>
       <title>The Image Object</title>

@@ -29,6 +29,28 @@ cp -a /tmp/minimal_0 /tmp/remove-relative
 (cd /tmp && portablectl remove ./remove-relative)
 test ! -e /tmp/remove-relative
 
+# "portablectl clean" removes hidden images, but keeps those that are attached or referenced by an mstack
+mkdir -p /var/lib/portables
+cp -a /tmp/minimal_0 /var/lib/portables/.clean-hidden
+cp -a /tmp/minimal_0 /var/lib/portables/.clean-mstack-layer
+cp -a /tmp/minimal_0 /var/lib/portables/.clean-attached
+cp -a /tmp/minimal_0 /var/lib/portables/clean-visible
+mkdir /var/lib/portables/clean.mstack
+ln -s ../.clean-mstack-layer /var/lib/portables/clean.mstack/layer@0
+portablectl "${ARGS[@]}" attach --runtime /var/lib/portables/.clean-attached minimal-app0
+portablectl clean
+test ! -e /var/lib/portables/.clean-hidden
+test -d /var/lib/portables/.clean-mstack-layer
+test -d /var/lib/portables/.clean-attached
+test -d /var/lib/portables/clean-visible
+portablectl detach --runtime /var/lib/portables/.clean-attached minimal-app0
+rm -rf /var/lib/portables/clean.mstack
+portablectl clean
+test ! -e /var/lib/portables/.clean-mstack-layer
+test ! -e /var/lib/portables/.clean-attached
+test -d /var/lib/portables/clean-visible
+rm -rf /var/lib/portables/clean-visible
+
 rm -rf /tmp/symlink-unit
 cp -a /tmp/minimal_0 /tmp/symlink-unit
 printf '[Service]\nExecStart=/bin/true\n' >/tmp/portable-host-unit

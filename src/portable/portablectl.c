@@ -15,6 +15,7 @@
 #include "chase.h"
 #include "env-file.h"
 #include "format-table.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "glyph-util.h"
 #include "install.h"
@@ -48,6 +49,7 @@ static bool arg_no_block = false;
 static char **arg_extension_images = NULL;
 static bool arg_force = false;
 static bool arg_clean = false;
+static bool arg_all = false;
 static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 
 STATIC_DESTRUCTOR_REGISTER(arg_extension_images, strv_freep);
@@ -1487,6 +1489,73 @@ static int verb_remove_image(int argc, char *argv[], uintptr_t _data, void *user
         return 0;
 }
 
+VERB(verb_clean_images, "clean", /* argspec= */ NULL, VERB_ANY, 1, 0,
+     "Remove hidden (or all) detached images");
+static int verb_clean_images(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        uint64_t usage, total = 0;
+        const char *name;
+        unsigned c = 0;
+        int r;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        r = bus_message_new_method_call(bus, &m, bus_portable_mgr, "CleanPool");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append(m, "s", arg_all ? "all" : "hidden");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        /* This is a slow operation, hence turn off any method call timeouts */
+        r = sd_bus_call(bus, m, USEC_INFINITY, &error, &reply);
+        if (r < 0)
+                return log_error_errno(r, "Could not clean pool: %s", bus_error_message(&error, r));
+
+        r = sd_bus_message_enter_container(reply, 'a', "(st)");
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        while ((r = sd_bus_message_read(reply, "(st)", &name, &usage)) > 0) {
+                if (usage == UINT64_MAX) {
+                        if (!arg_quiet)
+                                log_info("Removed image '%s'", name);
+                        total = UINT64_MAX;
+                } else {
+                        if (!arg_quiet)
+                                log_info("Removed image '%s'. Freed exclusive disk space: %s",
+                                         name, FORMAT_BYTES(usage));
+                        if (total != UINT64_MAX)
+                                total += usage;
+                }
+                c++;
+        }
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        r = sd_bus_message_exit_container(reply);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        if (arg_quiet)
+                return 0;
+
+        if (total == UINT64_MAX)
+                log_info("Removed %u images in total.", c);
+        else
+                log_info("Removed %u images in total. Total freed exclusive disk space: %s.",
+                         c, FORMAT_BYTES(total));
+
+        return 0;
+}
+
 VERB(verb_set_limit, "set-limit", "[NAME|PATH] LIMIT\0", 2, 3, 0,
      "Set image or pool size limit (disk quota)");
 static int verb_set_limit(int argc, char *argv[], uintptr_t _data, void *userdata) {
@@ -1674,6 +1743,11 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                             "When detaching, also remove configuration, state, "
                             "cache, logs or runtime data of the portable service(s)"):
                         arg_clean = true;
+                        break;
+
+                OPTION('a', "all", NULL,
+                       "When cleaning, remove all detached images, not just hidden ones"):
+                        arg_all = true;
                         break;
 
                 OPTION_LONG("user", NULL, /* help= */ NULL):

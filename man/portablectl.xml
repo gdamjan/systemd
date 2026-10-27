@@ -279,6 +279,22 @@
       </varlistentry>
 
       <varlistentry>
+        <term><command>clean</command></term>
+
+        <listitem><para>Removes hidden portable service images, i.e. those whose name begins with a dot,
+        from the image search paths. Images that are currently attached, images in
+        <filename>/usr/</filename>, and hidden images that are referenced via a symbolic link from a
+        <filename>.mstack/</filename> directory (see
+        <citerefentry><refentrytitle>systemd.mstack</refentrytitle><manvolnum>7</manvolnum></citerefentry>)
+        are not removed.</para>
+
+        <para>When combined with the <option>--all</option> switch removes all detached images, not just
+        hidden ones.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><command>set-limit</command> [<replaceable>IMAGE</replaceable>] <replaceable>BYTES</replaceable></term>
 
         <listitem><para>Sets the maximum size in bytes that a specific portable service image, or all images, may grow
@@ -406,6 +422,16 @@
         directories of the portable service are removed from the host system.</para>
 
         <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-a</option></term>
+        <term><option>--all</option></term>
+
+        <listitem><para>When used with <command>clean</command>, remove all detached images, not just hidden
+        ones.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
       </varlistentry>
 
       <varlistentry>

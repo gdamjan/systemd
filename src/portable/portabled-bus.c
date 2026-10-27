@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-bus.h"
 
 #include "alloc-util.h"
@@ -7,15 +9,22 @@
 #include "bus-object.h"
 #include "bus-polkit.h"
 #include "discover-image.h"
+#include "fd-util.h"
 #include "hashmap.h"
+#include "image-clean-pool.h"
 #include "io-util.h"
 #include "log.h"
+#include "pidref.h"
 #include "portable.h"
 #include "portabled.h"
 #include "portabled-bus.h"
 #include "portabled-image.h"
 #include "portabled-image-bus.h"
+#include "portabled-operation.h"
+#include "process-util.h"
+#include "set.h"
 #include "strv.h"
+#include "tmpfile-util.h"
 
 static int property_get_pool_path(
                 sd_bus *bus,
@@ -355,6 +364,151 @@ static int method_set_image_limit(sd_bus_message *message, void *userdata, sd_bu
         return redirect_method_to_image(userdata, message, error, bus_image_common_set_limit);
 }
 
+static int clean_pool_done(Operation *operation, int child_error, sd_bus_error *error) {
+        assert(operation);
+        assert(operation->message);
+
+        return image_clean_pool_reply(operation->message, &operation->extra_fd, child_error, error);
+}
+
+static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
+        _cleanup_(pidref_done_sigkill_wait) PidRef child = PIDREF_NULL;
+        _cleanup_hashmap_free_ Hashmap *images = NULL;
+        _cleanup_set_free_ Set *mstack_layers = NULL;
+        _cleanup_free_ Image **remove = NULL;
+        _cleanup_close_ int result_fd = -EBADF;
+        ImageCleanPoolMode mode;
+        Manager *m = ASSERT_PTR(userdata);
+        Operation *operation;
+        size_t n_remove = 0;
+        const char *mm;
+        Image *image;
+        int r;
+
+        assert(message);
+
+        if (m->n_operations >= OPERATIONS_MAX)
+                return sd_bus_error_set(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Too many ongoing operations.");
+
+        r = sd_bus_message_read(message, "s", &mm);
+        if (r < 0)
+                return r;
+
+        mode = image_clean_pool_mode_from_string(mm);
+        if (mode < 0)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unknown mode '%s'.", mm);
+
+        if (m->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "verb", "clean_pool",
+                        "mode", mm,
+                        NULL
+                };
+
+                r = bus_verify_polkit_async(
+                                message,
+                                "org.freedesktop.portable1.manage-images",
+                                details,
+                                &m->polkit_registry,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
+
+        r = image_discover(m->runtime_scope, IMAGE_PORTABLE, /* root= */ NULL, &images);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to discover images: %m");
+
+        if (mode == IMAGE_CLEAN_POOL_REMOVE_HIDDEN) {
+                r = image_collect_mstack_layers(images, &mstack_layers);
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to collect mstack layers: %m");
+        }
+
+        /* Determine which images to remove here rather than in the child, since checking whether an image
+         * is attached requires talking to the service manager via our bus connection. */
+        HASHMAP_FOREACH(image, images) {
+                _cleanup_(sd_bus_error_free) sd_bus_error state_error = SD_BUS_ERROR_NULL;
+                PortableState state;
+
+                /* We can't remove vendor images (i.e. those in /usr) */
+                if (image_is_vendor(image))
+                        continue;
+                if (image_is_host(image))
+                        continue;
+                if (mode == IMAGE_CLEAN_POOL_REMOVE_HIDDEN) {
+                        if (!image_is_hidden(image))
+                                continue;
+                        if (image_is_mstack_layer(image, mstack_layers)) {
+                                log_debug("Keeping image '%s' because it's referenced by an mstack.", image->name);
+                                continue;
+                        }
+                }
+
+                r = portable_get_state(
+                                m->runtime_scope,
+                                sd_bus_message_get_bus(message),
+                                image->path,
+                                /* extension_image_paths= */ NULL,
+                                /* flags= */ 0,
+                                &state,
+                                &state_error);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to determine state of image '%s', keeping it: %s",
+                                        image->name, bus_error_message(&state_error, r));
+                        continue;
+                }
+                if (state != PORTABLE_DETACHED) {
+                        log_debug("Keeping image '%s' because it's attached.", image->name);
+                        continue;
+                }
+
+                if (!GREEDY_REALLOC(remove, n_remove + 1))
+                        return -ENOMEM;
+
+                remove[n_remove++] = image;
+        }
+
+        if (pipe2(errno_pipe_fd, O_CLOEXEC|O_NONBLOCK) < 0)
+                return sd_bus_error_set_errnof(error, errno, "Failed to create pipe: %m");
+
+        /* Create a temporary file we can dump information about deleted images into. */
+        result_fd = open_tmpfile_unlinkable(NULL, O_RDWR|O_CLOEXEC);
+        if (result_fd < 0)
+                return sd_bus_error_set_errnof(error, result_fd, "Failed to open tmpfile: %m");
+
+        /* This might be a slow operation, run it asynchronously in a background process */
+        r = pidref_safe_fork("(sd-clean)", FORK_RESET_SIGNALS, &child);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
+        if (r == 0) {
+                errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
+
+                r = image_clean_pool_remove(remove, n_remove, m->runtime_scope, result_fd);
+                if (r < 0)
+                        report_errno_and_exit(errno_pipe_fd[1], r);
+
+                result_fd = safe_close(result_fd);
+                _exit(EXIT_SUCCESS);
+        }
+
+        errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
+
+        r = operation_new(m, &child, message, errno_pipe_fd[0], &operation);
+        if (r < 0)
+                return r;
+
+        /* operation_new() took ownership of the child and the errno fd */
+        errno_pipe_fd[0] = -EBADF;
+
+        operation->extra_fd = TAKE_FD(result_fd);
+        operation->done = clean_pool_done;
+        return 1;
+}
+
 static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
         uint64_t limit;
@@ -516,6 +670,11 @@ const sd_bus_vtable manager_vtable[] = {
                                 SD_BUS_ARGS("t", limit),
                                 SD_BUS_NO_RESULT,
                                 method_set_pool_limit,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("CleanPool",
+                                SD_BUS_ARGS("s", mode),
+                                SD_BUS_RESULT("a(st)", images),
+                                method_clean_pool,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_VTABLE_END
 };
